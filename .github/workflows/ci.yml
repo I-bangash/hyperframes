@@ -555,19 +555,29 @@ jobs:
 
           # The default build first. It is the one users get, and the arm that
           # caught the regression this gate exists for.
+          # Capture both statuses so either failure still leaves two evidence files.
+          DEFAULT_STATUS=0
           STUDIO_URL="http://localhost:5313/#project/timeline-virtualization" \
             TIMELINE_ROW_VIRTUALIZATION=off \
             TIMELINE_ELEMENT_COUNT=1000 \
             TIMELINE_TIER=ci \
             node packages/studio/tests/e2e/timeline-virtualization.mjs \
-            | tee /tmp/timeline-gate-default.json
+            | tee /tmp/timeline-gate-default.json \
+            || DEFAULT_STATUS=$?
 
+          VIRTUALIZED_STATUS=0
           STUDIO_URL="http://localhost:5314/#project/timeline-virtualization" \
             TIMELINE_ROW_VIRTUALIZATION=on \
             TIMELINE_ELEMENT_COUNT=50000 \
             TIMELINE_TIER=ci \
             node packages/studio/tests/e2e/timeline-virtualization.mjs \
-            | tee /tmp/timeline-gate-virtualized.json
+            | tee /tmp/timeline-gate-virtualized.json \
+            || VIRTUALIZED_STATUS=$?
+
+          if (( DEFAULT_STATUS != 0 || VIRTUALIZED_STATUS != 0 )); then
+            echo "FAIL: default=${DEFAULT_STATUS}, virtualized=${VIRTUALIZED_STATUS}"
+            exit 1
+          fi
       - name: Upload gate evidence
         # The gate's whole output is machine-readable evidence, and a red run is
         # exactly when someone needs to read it. Keep it on failure too.
@@ -781,30 +791,24 @@ jobs:
         with:
           fetch-depth: 0
       - name: Check file sizes (max 600 lines)
-        # Scoped to files THIS PR changed under packages/studio. Walking the
-        # whole tree blamed every unrelated PR for pre-existing offenders.
-        # Falls back to a full scan on push events (no base ref available)
-        # so the rule still guards main.
+        # Scope the check to files this event changed. Walking the whole tree
+        # blames unrelated changes for pre-existing offenders.
         run: |
           set -e
           if [ -n "${{ github.base_ref }}" ]; then
-            mapfile -t files < <(
-              git diff --name-only --diff-filter=ACMR \
-                "origin/${{ github.base_ref }}...HEAD" -- \
-                'packages/studio/**/*.ts' 'packages/studio/**/*.tsx' \
-                | grep -vE '\.(test|spec)\.(ts|tsx)$|\.generated\.' || true
-            )
+            range="origin/${{ github.base_ref }}...HEAD"
           else
-            mapfile -t files < <(
-              find packages/studio -path '*/node_modules' -prune -o \
-                \( -name '*.ts' -o -name '*.tsx' \) -print \
-                | grep -vE '\.(test|spec)\.(ts|tsx)$|\.generated\.'
-            )
+            range="${{ github.event.before }}..HEAD"
           fi
+          mapfile -t files < <(
+            git diff --name-only --diff-filter=ACMR "$range" -- \
+              'packages/studio/**/*.ts' 'packages/studio/**/*.tsx' \
+              | grep -vE '\.(test|spec)\.(ts|tsx)$|\.generated\.' || true
+          )
           EXIT=0
           for f in "${files[@]}"; do
             [ -z "$f" ] && continue
-            [ -f "$f" ] || continue  # skip files deleted in this PR
+            [ -f "$f" ] || continue  # skip files deleted in this event
             lines=$(wc -l < "$f")
             if [ "$lines" -gt 600 ]; then
               echo "::error file=$f::$f has $lines lines (max 600)"
