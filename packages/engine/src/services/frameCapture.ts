@@ -145,6 +145,13 @@ export interface CaptureSession {
   beginFrameIntervalMs: number;
   beginFrameHasDamageCount: number;
   beginFrameNoDamageCount: number;
+  /**
+   * True once the session's first capture has run the one-off settle in
+   * `prepareFrameForCapture` (post-seek media wait + a non-output compositor
+   * cycle). Reset by `prepareCaptureSessionForReuse` — a reused session jumps
+   * to a new range's first frame and re-enters the same race.
+   */
+  firstCaptureSettled?: boolean;
   /** Optional producer config — when set, overrides module-level env var constants. */
   config?: Partial<EngineConfig>;
   /** True if running on SwiftShader (detected at init). Undefined before init. */
@@ -2552,6 +2559,85 @@ async function prepareFrameForCapture(
     });
   }
 
+  // ── First-capture settle (distributed chunk "frame-0 flashback") ─────────
+  // A session's FIRST capture races the first nonzero seek's decode + paint:
+  // the readiness waits at init only prove t=0 readiness, so on chunk workers
+  // the first captured frame intermittently shows the composition's t=0 state
+  // (native <video> at its first frame, GSAP overlays at their initial pose) —
+  // the capture itself performs the warmup compositor work, and frame
+  // chunkStart+1 onward is fine. Observed in production at exactly the chunk
+  // starts (multiples of ceil(totalFrames/16)), nondeterministic across runs
+  // because environment timing decides whether the single capture wins.
+  //
+  // Settle ONCE per session, after the seek + hooks above and before the
+  // capture that returns pixels:
+  //  1. wait (bounded) for native <video> seeks to land — only when no
+  //     before-capture injector owns them (the injector replaces videos with
+  //     <img> siblings, so native decode state is irrelevant),
+  //  2. force one non-output compositor cycle so the post-seek state is
+  //     painted before the real capture.
+  // BeginFrame: a visual (noDisplayUpdates: false), screenshot-free tick at
+  // firstCaptureTick − interval/2 — strictly after the init warmup/probe
+  // ticks (base − 6..5·interval) and strictly before the first capture tick,
+  // preserving tick monotonicity. (Re-capturing at the SAME tick — the naive
+  // discardWarmupCapture revival — is a known compositor wedge; see
+  // renderChunk's comment.)
+  // Screenshot: one throwaway 1×1 Page.captureScreenshot (the same
+  // paint-flush idiom the composite protocol above uses).
+  // drawElement advances its own per-frame BeginFrame + paint wait — skip.
+  if (!session.firstCaptureSettled) {
+    session.firstCaptureSettled = true;
+    if (!session.onBeforeCapture) {
+      const deadline = Date.now() + 1500;
+      // Node-side polling — page-side timers may be virtualized by the
+      // virtual-time shim, so an in-page busy-wait could never advance.
+      for (;;) {
+        const ready = await page
+          .evaluate(() =>
+            Array.from(document.querySelectorAll<HTMLVideoElement>("video[data-start]")).every(
+              (v) => !v.seeking && v.readyState >= 2,
+            ),
+          )
+          .catch(() => true);
+        if (ready) break;
+        if (Date.now() > deadline) {
+          console.warn(
+            "[FrameCapture] first-capture settle: native video seek(s) still pending after 1500ms — capturing anyway",
+          );
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 25));
+      }
+    }
+    try {
+      if (session.captureMode === "beginframe" && session.beginFrameTimeTicks > 0) {
+        const client = await getCdpSession(page);
+        await client.send("HeadlessExperimental.beginFrame", {
+          frameTimeTicks:
+            session.beginFrameTimeTicks +
+            frameIndex * session.beginFrameIntervalMs -
+            session.beginFrameIntervalMs / 2,
+          interval: session.beginFrameIntervalMs,
+          noDisplayUpdates: false,
+          // no screenshot param — settle only; the real capture follows
+        });
+      } else if (session.captureMode === "screenshot") {
+        const cdp = await getCdpSession(page);
+        await cdp.send("Page.captureScreenshot", {
+          format: "jpeg",
+          quality: 1,
+          clip: { x: 0, y: 0, width: 1, height: 1, scale: 1 },
+        });
+      }
+    } catch (error) {
+      // Fail-soft: a settle failure must never fail the frame — worst case we
+      // are back to the pre-settle race for this one frame.
+      console.warn(
+        `[FrameCapture] first-capture settle failed (continuing): ${(error as Error).message}`,
+      );
+    }
+  }
+
   return { quantizedTime, seekMs, beforeCaptureMs };
 }
 
@@ -3755,6 +3841,9 @@ export function prepareCaptureSessionForReuse(
   // lastFrameBuffer must be re-seeded by this render's first fresh capture.
   session.lastFrameBuffer = undefined;
   session.staticDedupCount = 0;
+  // A reused session jumps to a NEW range's first frame — same first-capture
+  // race as a fresh session; re-settle before its first capture.
+  session.firstCaptureSettled = false;
 }
 
 export async function getCompositionDuration(session: CaptureSession): Promise<number> {
